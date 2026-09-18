@@ -1,0 +1,110 @@
+name: Publish repo
+on:
+  push:
+    tags:
+    - fedora-coreos-*_kernel-*_zfs-*
+jobs:
+  publish-repo:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+    - id: parse
+      run: |
+        REST="${GITHUB_REF_NAME#fedora-coreos-}"
+        BASE_IMAGE_VERSION="${REST%%_*}"
+        REST="${REST#*_kernel-}"
+        KERNEL_VERSION="${REST%%_*}"
+        ZFS_VERSION="${REST#*_zfs-}"
+        printf 'BASE_IMAGE_VERSION=%s\nKERNEL_VERSION=%s\nZFS_VERSION=%s\n' "$BASE_IMAGE_VERSION" "$KERNEL_VERSION" "$ZFS_VERSION" >>"$GITHUB_OUTPUT"
+    - run: |
+        sudo apt-get update
+
+        case "$(dpkg --print-architecture)" in
+          amd64)
+            GO_CONTAINERREGISTRY_ARCH='x86_64'
+            ;;
+          arm64)
+            GO_CONTAINERREGISTRY_ARCH='arm64'
+            ;;
+          *)
+            exit 1
+            ;;
+        esac
+        curl ${{ github.server_url }}/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$GO_CONTAINERREGISTRY_ARCH.tar.gz --location --output - --fail \
+          | tar --gzip --file - --extract --directory /usr/local/bin crane --verbose
+
+        sudo apt-get --no-install-recommends --no-install-suggests -y install createrepo-c
+    - run: |
+        BASE_IMAGE_VERSION='${{ steps.parse.outputs.BASE_IMAGE_VERSION }}'
+        mkdir ${{ runner.temp }}/repo
+        for CONTAINER_PLATFORM in linux/amd64 linux/arm64; do
+          crane export --platform "$CONTAINER_PLATFORM" "ghcr.io/ublue-os/akmods-zfs:coreos-stable-${BASE_IMAGE_VERSION%%.*}-${{ steps.parse.outputs.KERNEL_VERSION }}" - \
+            | tar --file - --anchored --extract --directory ${{ runner.temp }}/repo --transform 's/.*\///' --verbose \
+              --exclude 'rpms/kmods/zfs/debug' \
+              --exclude 'rpms/kmods/zfs/devel' \
+              --exclude 'rpms/kmods/zfs/other/zfs-test-*.rpm' \
+              --exclude 'rpms/kmods/zfs/src' \
+              --exclude 'rpms/ublue-os'
+        done
+        find ${{ runner.temp }}/repo -mindepth 1 -type d -empty -ls -delete
+    - run: |
+        [ -n "$(find ${{ runner.temp }}/repo -maxdepth 1 -type f -name "zfs-${{ steps.parse.outputs.ZFS_VERSION }}-*.rpm" -print -quit)" ]
+    - run: |
+        createrepo_c --baseurl ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/ --verbose ${{ runner.temp }}/repo
+        sed -i.original 's|<location href="repodata/|<location xml:base="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/" href="|g' ${{ runner.temp }}/repo/repodata/repomd.xml
+        diff ${{ runner.temp }}/repo/repodata/repomd.xml{.original,} || [ $? -eq 1 ]
+    - id: previous-exists
+      run: |
+        mkdir -p --verbose ${{ runner.temp }}/previous_repo/repodata
+        HTTP_CODE="$(curl ${{ github.server_url }}/${{ github.repository }}/releases/download/repodata/repomd.xml \
+          --location \
+          --write-out '%{http_code}' \
+          --output-dir ${{ runner.temp }}/previous_repo/repodata \
+          --remote-name \
+          --remote-time)"
+        printf 'HTTP_CODE=%s\n' "$HTTP_CODE" >>"$GITHUB_OUTPUT"
+    - if: ${{ success() && steps.previous-exists.outputs.HTTP_CODE == 404 }}
+      run: |
+        mkdir -p --verbose ${{ runner.temp }}/merged_repo/repodata
+        cp -a ${{ runner.temp }}/repo/repodata/repomd.xml ${{ runner.temp }}/merged_repo/repodata/
+    - if: ${{ success() && steps.previous-exists.outputs.HTTP_CODE == 200 }}
+      run: |
+        curl --remote-name-all \
+          $( \
+            grep --perl-regexp --only-matching '(?<=<location xml:base=").+(?="/>)' ${{ runner.temp }}/previous_repo/repodata/repomd.xml \
+              | sed 's|" href="||g' \
+          ) \
+          --location \
+          --output-dir ${{ runner.temp }}/previous_repo \
+          --remote-time \
+          --fail \
+          --parallel
+
+        ln -s --relative ${{ runner.temp }}/repo/repodata/*.xml.zst ${{ runner.temp }}/repo/
+
+        mergerepo_c --all --omit-baseurl --repo ${{ runner.temp }}/previous_repo --repo ${{ runner.temp }}/repo --outputdir ${{ runner.temp }}/merged_repo --verbose
+
+        sed -i.original 's|<location href="repodata/|<location xml:base="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/" href="|g' ${{ runner.temp }}/merged_repo/repodata/repomd.xml
+        diff ${{ runner.temp }}/merged_repo/repodata/repomd.xml{.original,} || [ $? -eq 1 ]
+
+        ln -s --relative ${{ runner.temp }}/merged_repo/repodata/{,cumulative-}repomd.xml
+    - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      with:
+        target_commitish: ${{ github.sha }}
+        working_directory: ${{ runner.temp }}
+        files: |
+          repo/*.rpm
+          repo/repodata/*.xml.zst
+          repo/repodata/repomd.xml
+          merged_repo/repodata/*.xml.zst
+          merged_repo/repodata/cumulative-repomd.xml
+    - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      with:
+        target_commitish: ${{ github.sha }}
+        tag_name: repodata
+        working_directory: ${{ runner.temp }}
+        files: |
+          merged_repo/repodata/repomd.xml
+        overwrite_files: true
+        make_latest: false
