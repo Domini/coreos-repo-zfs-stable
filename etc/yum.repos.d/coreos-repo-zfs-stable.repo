@@ -1,0 +1,9 @@
+[coreos-repo-zfs-stable]
+name=coreos-repo-zfs-stable
+baseurl=https://github.com/Domini/coreos-repo-zfs-stable/releases/download/
+enabled=1
+repo_gpgcheck=0
+type=rpm
+gpgcheck=0
+metadata_expire=6h
+skip_if_unavailable=False
