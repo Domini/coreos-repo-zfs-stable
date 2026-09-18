@@ -5,7 +5,7 @@ on:
     - fedora-coreos-*_kernel-*_zfs-*
 jobs:
   publish-repo:
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-26.04-arm
     permissions:
       contents: write
     steps:
